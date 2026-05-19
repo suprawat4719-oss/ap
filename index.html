@@ -1,11 +1,9 @@
-<!-- AP SYSTEM v1.6 — 2026-05-19
-     changelog v1.5: แก้บัคสำคัญ 6 จุด —
-       (1) saveInvoice: f-vendorRef ไม่มีในฟอร์ม → TypeError silent crash แก้ด้วย try/catch + optional chaining,
-       (2) เพิ่ม input field f-vendorRef (เลขที่เอกสารเจ้าหนี้) ในฟอร์ม,
-       (3) OCR: เพิ่ม x-api-key/anthropic-version headers + ตรวจ key ก่อนเรียก API,
-       (4) Settings: เพิ่มช่อง Claude API Key (เก็บใน localStorage),
-       (5) autofillVendor(): implement auto-fill bank/payDays จาก vendor record เมื่อเลือก vendor,
-       (6) confirmPayment/deletePayment: เพิ่ม try/catch, เพิ่ม validate items ว่างใน saveInvoice
+<!-- AP SYSTEM v1.7 — 2026-05-19
+     changelog v1.7: แก้ autofillVendor เคลียร์ field ก่อน overwrite (ป้องกันธนาคาร vendor เก่าค้าง),
+       payment modal ใช้ vendor master เป็นหลักสำหรับข้อมูลธนาคาร (ไม่เชื่อ inv.vendorBank ที่อาจบันทึกผิด),
+       อัปเดต sidebar version/วันที่ให้ตรงกับ title
+     changelog v1.6: ปุ่มจ่ายตรงจากตาราง, AP→Finance sync, syncStatus badge, retry sync
+     changelog v1.5: แก้บัค 6 จุด — saveInvoice crash, f-vendorRef, OCR headers, Settings API key, autofillVendor, try/catch
      changelog v1.4: เพิ่ม vendorBankName, OCR prompt แม่นขึ้น
      changelog v1.3: รองรับใบวางบิล, OCR อ่าน prePmts, ธนาคารเจ้าหนี้
      changelog v1.2: OCR ด้วย Claude API
@@ -17,7 +15,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AP System | v1.6 — 2026-05-19</title>
+<title>AP System | v1.7 — 2026-05-19</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -307,7 +305,7 @@ body{font-family:'Sarabun',sans-serif;background:var(--bg);color:var(--ink);font
   <div class="sidebar-logo">
     <div class="logo-mark">▸ AP SYSTEM</div>
     <div class="logo-name">บัญชีเจ้าหนี้</div>
-    <div class="logo-sub">v1.4 — 2026-05-11</div>
+    <div class="logo-sub">v1.7 — 2026-05-19</div>
   </div>
   <div class="nav-section">หลัก</div>
   <button class="nav-item active" onclick="goPage('dashboard')" id="nav-dashboard"><span class="nav-icon">📊</span>Dashboard</button>
@@ -332,7 +330,7 @@ body{font-family:'Sarabun',sans-serif;background:var(--bg);color:var(--ink);font
     </div>
     <div class="sync-last" id="sync-last"></div>
   </div>
-  <div class="sidebar-footer">AP System v1.4</div>
+  <div class="sidebar-footer">AP System v1.7</div>
 </aside>
 
 <!-- ── MAIN ── -->
@@ -1667,11 +1665,11 @@ function openPaymentModal(id) {
   if (!inv) return;
   _payingInvoice = inv;
   const remain = invRemain(inv);
-  // ดึงข้อมูลธนาคาร: ใช้จาก invoice ก่อน ถ้าไม่มีดึงจาก vendor master
+  // ดึงข้อมูลธนาคาร: vendor master เป็นหลัก (ข้อมูลถูกต้องเสมอ) fallback ไป invoice fields
   const vend = (data.vendors||[]).find(x => x.id === inv.vendorId);
-  const bankName    = inv.vendorBank    || vend?.bank     || '';
-  const bankAcc     = inv.vendorBankAcc || vend?.bankAcc  || '';
-  const bankAccName = inv.vendorBankName|| vend?.bankName || '';
+  const bankName    = vend?.bank     || inv.vendorBank    || '';
+  const bankAcc     = vend?.bankAcc  || inv.vendorBankAcc || '';
+  const bankAccName = vend?.bankName || inv.vendorBankName|| '';
   const bankInfo = (bankName || bankAcc) ?
     `<div style="background:var(--blue-light);border-left:3px solid var(--blue-mid);border-radius:var(--r);padding:10px 14px;margin-bottom:16px">
       <div style="font-size:10px;font-weight:700;text-transform:uppercase;color:var(--blue);margin-bottom:4px">🏦 โอนเงินเข้าบัญชี</div>
