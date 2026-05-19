@@ -1,4 +1,4 @@
-<!-- AP SYSTEM v1.5 — 2026-05-19
+<!-- AP SYSTEM v1.6 — 2026-05-19
      changelog v1.5: แก้บัคสำคัญ 6 จุด —
        (1) saveInvoice: f-vendorRef ไม่มีในฟอร์ม → TypeError silent crash แก้ด้วย try/catch + optional chaining,
        (2) เพิ่ม input field f-vendorRef (เลขที่เอกสารเจ้าหนี้) ในฟอร์ม,
@@ -17,7 +17,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AP System | v1.5 — 2026-05-19</title>
+<title>AP System | v1.6 — 2026-05-19</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -514,6 +514,141 @@ async function storeDelete(col, id) {
 function syncLS(col, arr) { lsSave(col, arr); }
 
 // ══════════════════════════════════════
+// AP → FINANCE SYNC
+// ══════════════════════════════════════
+async function isAPFinanceMonthLocked(monthKey) {
+  try {
+    const cache = JSON.parse(localStorage.getItem('ap_month_locks_cache') || '{}');
+    if (cache[monthKey] !== undefined && Date.now() - (cache['__ts_' + monthKey] || 0) < 60000) return cache[monthKey];
+  } catch(e) {}
+  if (!_fbdb) return false;
+  try {
+    const snap = await _fbdb.collection('month_locks').doc(monthKey).get();
+    const locked = snap.exists && snap.data().locked === true;
+    try {
+      const cache = JSON.parse(localStorage.getItem('ap_month_locks_cache') || '{}');
+      cache[monthKey] = locked;
+      cache['__ts_' + monthKey] = Date.now();
+      localStorage.setItem('ap_month_locks_cache', JSON.stringify(cache));
+    } catch(e) {}
+    return locked;
+  } catch(e) { return false; }
+}
+
+async function findNextOpenAPFinanceDate(paymentDate) {
+  const origMonth = paymentDate.slice(0, 7);
+  if (!(await isAPFinanceMonthLocked(origMonth))) {
+    return { financeDate: paymentDate, financeMonth: origMonth, shifted: false, reason: '' };
+  }
+  let [y, m] = origMonth.split('-').map(Number);
+  for (let i = 0; i < 24; i++) {
+    m++; if (m > 12) { m = 1; y++; }
+    const candidate = `${y}-${String(m).padStart(2,'0')}`;
+    if (!(await isAPFinanceMonthLocked(candidate))) {
+      const financeDate = `${candidate}-01`;
+      return { financeDate, financeMonth: candidate, shifted: true,
+        reason: `จ่ายจริงวันที่ ${paymentDate} แต่เดือน ${origMonth} ปิดงวดแล้ว จึงลงบัญชีในเดือน ${candidate}` };
+    }
+  }
+  throw new Error(`ไม่พบเดือนบัญชีที่เปิดอยู่ภายใน 24 เดือน`);
+}
+
+async function syncAPPaymentToFinance(invoice, payment) {
+  if (!_fbdb) return null;
+  try {
+    const existing = await _fbdb.collection('fin_transactions').doc(payment.id).get();
+    if (existing.exists) return payment.id;
+  } catch(e) {}
+  const financeDate = payment.financeDate || payment.date;
+  const financeMonth = payment.financeMonth || financeDate.slice(0, 7);
+  const vendorName = getVendorName(invoice.vendorId);
+  const txDoc = {
+    id:                     payment.id,
+    type:                   'expense',
+    sourceModule:           'ap',
+    sourceApp:              'AP',
+    sourceType:             'AP_PAYMENT',
+    sourcePaymentId:        payment.id,
+    sourceRefId:            invoice.id,
+    sourceInvoiceId:        invoice.id,
+    invoiceNo:              invoice.docNo || '',
+    date:                   financeDate,
+    transferDate:           financeDate,
+    paymentDate:            payment.paymentDate || payment.date,
+    monthKey:               financeMonth,
+    party:                  vendorName,
+    vendorId:               invoice.vendorId || '',
+    vendorName:             vendorName,
+    category:               'จ่ายชำระเจ้าหนี้',
+    amount:                 Number(payment.amount) || 0,
+    method:                 payment.method || 'โอนเงิน',
+    referenceNo:            payment.ref || invoice.docNo || '',
+    originalPaymentMonth:   (payment.date||'').slice(0,7),
+    financeMonth:           financeMonth,
+    shiftedToNextOpenMonth: payment.shiftedToNextOpenMonth || false,
+    note:                   payment.shiftedReason || payment.note || '',
+    status:                 'confirmed',
+    syncStatus:             'linked',
+    createdAt:              payment.createdAt || new Date().toISOString(),
+    updatedAt:              new Date().toISOString(),
+    createdBy:              'ap_app',
+  };
+  try {
+    await _fbdb.collection('fin_transactions').doc(txDoc.id).set(txDoc);
+    _fbdb.collection('audit_logs').add({
+      action: 'AP_PAYMENT_SYNCED', app: 'ap', monthKey: financeMonth,
+      at: new Date().toISOString(),
+      detail: { invoiceId: invoice.id, paymentId: payment.id, amount: txDoc.amount,
+                docNo: invoice.docNo, paymentDate: txDoc.paymentDate, financeDate,
+                shifted: txDoc.shiftedToNextOpenMonth }
+    }).catch(()=>{});
+    return txDoc.id;
+  } catch(err) {
+    console.error('[AP→Finance] sync failed:', err);
+    return null;
+  }
+}
+
+function _apAddPendingSync(invoiceId, paymentId) {
+  try {
+    const q = JSON.parse(localStorage.getItem('ap_pending_sync') || '[]');
+    if (!q.find(x => x.invoiceId === invoiceId && x.paymentId === paymentId)) {
+      q.push({ invoiceId, paymentId, addedAt: new Date().toISOString() });
+      localStorage.setItem('ap_pending_sync', JSON.stringify(q));
+    }
+  } catch(e) {}
+}
+
+async function retrySyncAPQueue() {
+  if (!_fbdb) { toast('ไม่ได้เชื่อม Firebase', 'err'); return; }
+  const q = JSON.parse(localStorage.getItem('ap_pending_sync') || '[]');
+  if (!q.length) { toast('ไม่มีรายการ sync ค้างอยู่', 'info'); return; }
+  let ok = 0; const remaining = [];
+  for (const item of q) {
+    const inv = (data.ap_invoices||[]).find(i => i.id === item.invoiceId);
+    if (!inv) continue;
+    const pmt = (inv.payments||[]).find(p => p.id === item.paymentId &&
+      (p.syncStatus === 'failed' || p.syncStatus === 'pending' || !p.syncStatus));
+    if (!pmt) continue;
+    let freshFinance;
+    try { freshFinance = await findNextOpenAPFinanceDate(pmt.paymentDate || pmt.date); }
+    catch(e) { remaining.push(item); continue; }
+    const updatedPmt = { ...pmt, financeDate: freshFinance.financeDate, financeMonth: freshFinance.financeMonth, shiftedToNextOpenMonth: freshFinance.shifted, shiftedReason: freshFinance.reason };
+    const txId = await syncAPPaymentToFinance(inv, updatedPmt);
+    if (txId) {
+      const finalPayments = (inv.payments||[]).map(p => p.id === pmt.id ? { ...p, ...updatedPmt, financeTransactionId: txId, syncStatus: 'synced' } : p);
+      await storeUpdate('ap_invoices', inv.id, { payments: finalPayments }).catch(()=>{});
+      Object.assign(inv, { payments: finalPayments });
+      syncLS('ap_invoices', data.ap_invoices);
+      ok++;
+    } else { remaining.push(item); }
+  }
+  localStorage.setItem('ap_pending_sync', JSON.stringify(remaining));
+  toast(`Retry: สำเร็จ ${ok} รายการ${remaining.length ? `, ยังค้าง ${remaining.length} รายการ` : ''}`, ok > 0 ? 'ok' : 'err');
+}
+window.retrySyncAPQueue = retrySyncAPQueue;
+
+// ══════════════════════════════════════
 // FIREBASE SYNC
 // ══════════════════════════════════════
 async function pullFromFirebase() {
@@ -842,6 +977,7 @@ function refreshInvTable() {
         <tbody>${rows.map(i => {
           const st = invStatus(i); const diff = i.dueDate ? daysDiff(i.dueDate) : null;
           const dueCls = diff !== null && diff < 0 && st !== 'paid' && st !== 'cancelled' ? 'style="color:var(--red);font-weight:700"' : '';
+          const canPay = st !== 'paid' && st !== 'cancelled';
           return `<tr>
             <td class="mono bold" style="color:var(--accent);cursor:pointer" onclick="viewInvoice('${i.id}')">${escHtml(i.docNo)}</td>
             <td class="hide-mobile muted" style="font-size:11px">${escHtml(i.docType||'ใบแจ้งหนี้')}</td>
@@ -853,7 +989,10 @@ function refreshInvTable() {
             <td class="r mono bold" style="color:${invRemain(i)>0?'var(--red)':'var(--green)'}">฿${fmt(invRemain(i))}</td>
             <td>${statusBadge(st)}</td>
             <td class="c">${i.attachFile ? `<button class="btn btn-ghost btn-xs" onclick="viewAttach('${i.id}')">📎</button>` : '-'}</td>
-            <td><button class="btn btn-ghost btn-xs" onclick="viewInvoice('${i.id}')">ดู</button></td>
+            <td style="white-space:nowrap">
+              <button class="btn btn-ghost btn-xs" onclick="viewInvoice('${i.id}')">ดู</button>
+              ${canPay ? `<button class="btn btn-success btn-xs" onclick="openPaymentModal('${i.id}')" style="margin-left:4px">💸 จ่าย</button>` : ''}
+            </td>
           </tr>`;
         }).join('')}</tbody>
       </table>`}
@@ -907,7 +1046,12 @@ function viewInvoice(id) {
 
     <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--ink4);margin-bottom:8px">ประวัติการจ่ายเงิน</div>
     ${(inv.payments||[]).length === 0 ? '<div style="font-size:12px;color:var(--ink4);margin-bottom:14px">ยังไม่มีการจ่ายเงิน</div>' :
-      (inv.payments||[]).map(p=>`<div class="pmt-item"><div class="pmt-icon">💸</div><div class="pmt-info"><div style="font-size:13px;font-weight:600">${escHtml(p.method||'โอนเงิน')}</div><div class="pmt-date">${fmtDate(p.date)}</div>${p.note?`<div class="pmt-note">${escHtml(p.note)}</div>`:''}</div><div class="pmt-amt">-฿${fmt(p.amount)}</div><button class="pmt-del" onclick="deletePayment('${inv.id}','${p.id}')" title="ลบ">🗑</button></div>`).join('')}
+      (inv.payments||[]).map(p => {
+        const syncIcon = p.syncStatus === 'synced' ? '<span title="ลงบัญชี Finance แล้ว" style="color:var(--green);font-size:11px;margin-left:4px">✅ Finance</span>'
+          : p.syncStatus === 'failed' ? '<span title="sync Finance ไม่สำเร็จ" style="color:var(--red);font-size:11px;margin-left:4px">❌ Finance</span>'
+          : p.syncStatus === 'pending' ? '<span title="รอ sync Finance" style="color:var(--ink4);font-size:11px;margin-left:4px">⏳ Finance</span>' : '';
+        return `<div class="pmt-item"><div class="pmt-icon">💸</div><div class="pmt-info"><div style="font-size:13px;font-weight:600">${escHtml(p.method||'โอนเงิน')}${syncIcon}</div><div class="pmt-date">${fmtDate(p.date)}${p.ref?' · '+escHtml(p.ref):''}</div>${p.note?`<div class="pmt-note">${escHtml(p.note)}</div>`:''}</div><div class="pmt-amt">-฿${fmt(p.amount)}</div><button class="pmt-del" onclick="deletePayment('${inv.id}','${p.id}')" title="ลบ">🗑</button></div>`;
+      }).join('')}
 
     ${inv.note ? `<div style="font-size:12px;color:var(--ink3);padding:10px;background:var(--bg2);border-radius:var(--r);margin-bottom:14px">📝 ${escHtml(inv.note)}</div>` : ''}
     ${inv.attachFile ? `<div style="margin-bottom:14px"><button class="btn btn-outline btn-sm" onclick="viewAttach('${inv.id}')">📎 ดูไฟล์แนบ</button></div>` : ''}
@@ -1561,7 +1705,7 @@ async function confirmPayment() {
   if (!_payingInvoice) return;
   try {
     const amount = Number(document.getElementById('pmt-amount').value);
-    const date = document.getElementById('pmt-date').value;
+    const pmtDate = document.getElementById('pmt-date').value;
     const method = document.getElementById('pmt-method').value;
     const ref = document.getElementById('pmt-ref').value.trim();
     const note = document.getElementById('pmt-note').value.trim();
@@ -1569,7 +1713,27 @@ async function confirmPayment() {
     const remain = invRemain(_payingInvoice);
     if (amount > remain + 0.01) { toast(`จำนวนเงินเกินยอดค้างจ่าย (฿${fmt(remain)})`, 'err'); return; }
 
-    const pmt = {id: uid(), amount, date, method, ref, note};
+    // หา financeDate (เลื่อนเดือนถ้า Finance ปิดงวด)
+    let financeInfo;
+    try { financeInfo = await findNextOpenAPFinanceDate(pmtDate); }
+    catch(e) { toast('เกิดข้อผิดพลาด: ' + e.message, 'err'); return; }
+    if (financeInfo.shifted) {
+      toast(`เดือน ${pmtDate.slice(0,7)} ปิดแล้ว — จะลงบัญชี Finance ในเดือน ${financeInfo.financeMonth} แทน`, 'info');
+    }
+
+    const pmt = {
+      id: uid(),
+      date: pmtDate, paymentDate: pmtDate,
+      financeDate: financeInfo.financeDate,
+      financeMonth: financeInfo.financeMonth,
+      originalPaymentMonth: pmtDate.slice(0,7),
+      shiftedToNextOpenMonth: financeInfo.shifted,
+      shiftedReason: financeInfo.reason,
+      amount, method, ref, note,
+      createdAt: new Date().toISOString(),
+      financeTransactionId: null,
+      syncStatus: 'pending',
+    };
     const pmts = [...(_payingInvoice.payments || []), pmt];
     const ok = await storeUpdate('ap_invoices', _payingInvoice.id, {payments: pmts});
     if (ok) {
@@ -1578,6 +1742,19 @@ async function confirmPayment() {
       toast('บันทึกการจ่ายเงินสำเร็จ','ok');
       closeModal();
       goPage('invoices');
+      // sync ไป fin_transactions แบบ background
+      syncAPPaymentToFinance(_payingInvoice, pmt).then(txId => {
+        const syncSt = txId ? 'synced' : 'failed';
+        const finalPmts = (_payingInvoice.payments||[]).map(p =>
+          p.id === pmt.id ? {...p, financeTransactionId: txId||null, syncStatus: syncSt} : p);
+        storeUpdate('ap_invoices', _payingInvoice.id, {payments: finalPmts}).catch(()=>{});
+        Object.assign(_payingInvoice, {payments: finalPmts});
+        syncLS('ap_invoices', data.ap_invoices);
+        if (!txId) _apAddPendingSync(_payingInvoice.id, pmt.id);
+      }).catch(e => {
+        console.warn('[AP→Finance] background sync error:', e);
+        _apAddPendingSync(_payingInvoice.id, pmt.id);
+      });
     }
   } catch(e) { toast('เกิดข้อผิดพลาด: ' + e.message, 'err'); }
 }
@@ -1940,6 +2117,7 @@ function renderSettings() {
         <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
           <button class="btn btn-outline btn-sm" onclick="pullFromFirebase()">↓ Pull จาก Firebase</button>
           <button class="btn btn-outline btn-sm" onclick="pushToFirebase()">↑ Push ไป Firebase</button>
+          <button class="btn btn-outline btn-sm" onclick="retrySyncAPQueue()">🔄 Retry AP→Finance${(()=>{const q=JSON.parse(localStorage.getItem('ap_pending_sync')||'[]');return q.length?` (${q.length})`:''})()}</button>
         </div>
       </div>
     </div>`;
