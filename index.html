@@ -1515,13 +1515,21 @@ window.viewAttach = viewAttach;
 
 function autofillVendor() {
   const vendorId = document.getElementById('f-vendorId')?.value;
+  const bankEl    = document.getElementById('f-vendorBank');
+  const bankAccEl = document.getElementById('f-vendorBankAcc');
+  const bankNameEl= document.getElementById('f-vendorBankName');
+  const payDaysEl = document.getElementById('f-payDays');
+  // เคลียร์ field ธนาคารก่อนเสมอ เพื่อป้องกันข้อมูลเจ้าหนี้เดิมค้างอยู่
+  if (bankEl)     bankEl.value = '';
+  if (bankAccEl)  bankAccEl.value = '';
+  if (bankNameEl) bankNameEl.value = '';
   if (!vendorId) return;
   const v = (data.vendors||[]).find(x => x.id === vendorId);
   if (!v) return;
-  if (v.bank)        { const el = document.getElementById('f-vendorBank');     if (el && !el.value) el.value = v.bank; }
-  if (v.bankAcc)     { const el = document.getElementById('f-vendorBankAcc');  if (el && !el.value) el.value = v.bankAcc; }
-  if (v.bankName)    { const el = document.getElementById('f-vendorBankName'); if (el && !el.value) el.value = v.bankName; }
-  if (v.paymentDays) { const el = document.getElementById('f-payDays');        if (el) { el.value = v.paymentDays; calcDueDate(); } }
+  if (bankEl && v.bank)         bankEl.value = v.bank;
+  if (bankAccEl && v.bankAcc)   bankAccEl.value = v.bankAcc;
+  if (bankNameEl && v.bankName) bankNameEl.value = v.bankName;
+  if (payDaysEl && v.paymentDays) { payDaysEl.value = v.paymentDays; calcDueDate(); }
 }
 window.autofillVendor = autofillVendor;
 
@@ -1659,9 +1667,21 @@ function openPaymentModal(id) {
   if (!inv) return;
   _payingInvoice = inv;
   const remain = invRemain(inv);
+  // ดึงข้อมูลธนาคาร: ใช้จาก invoice ก่อน ถ้าไม่มีดึงจาก vendor master
+  const vend = (data.vendors||[]).find(x => x.id === inv.vendorId);
+  const bankName    = inv.vendorBank    || vend?.bank     || '';
+  const bankAcc     = inv.vendorBankAcc || vend?.bankAcc  || '';
+  const bankAccName = inv.vendorBankName|| vend?.bankName || '';
+  const bankInfo = (bankName || bankAcc) ?
+    `<div style="background:var(--blue-light);border-left:3px solid var(--blue-mid);border-radius:var(--r);padding:10px 14px;margin-bottom:16px">
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;color:var(--blue);margin-bottom:4px">🏦 โอนเงินเข้าบัญชี</div>
+      <div style="font-size:13px;font-weight:600;color:var(--ink)">${escHtml(bankName)}${bankAcc ? ' · <span style="font-family:monospace">'+escHtml(bankAcc)+'</span>' : ''}</div>
+      ${bankAccName ? `<div style="font-size:12px;color:var(--ink3);margin-top:2px">ชื่อบัญชี: ${escHtml(bankAccName)}</div>` : ''}
+    </div>` : '';
   document.getElementById('modal-payment').innerHTML = `
     <div class="modal-title">💸 บันทึกจ่ายเงิน</div>
     <div style="font-size:12px;color:var(--ink3);margin-bottom:14px">${escHtml(inv.docNo)} — ${escHtml(getVendorName(inv.vendorId))}</div>
+    ${bankInfo}
     <div style="background:var(--red-light);padding:10px 14px;border-radius:var(--r);margin-bottom:16px;display:flex;justify-content:space-between">
       <span style="font-size:12px;color:var(--red)">ยอดค้างจ่าย</span>
       <span style="font-family:'IBM Plex Mono',monospace;font-weight:700;color:var(--red)">฿${fmt(remain)}</span>
